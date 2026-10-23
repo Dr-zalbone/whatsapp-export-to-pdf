@@ -18,7 +18,8 @@ app.use('/fonts', express.static(modules('@fontsource')));
 let browserPromise;
 function getBrowser() {
   browserPromise ??= puppeteer.launch({
-    headless: 'shell',
+    // A system Chrome/Chromium (set by the Dockerfile) runs in new headless mode; locally we use Puppeteer's headless shell.
+    headless: process.env.PUPPETEER_EXECUTABLE_PATH ? true : 'shell',
     args: process.platform === 'linux' ? ['--no-sandbox', '--disable-dev-shm-usage'] : [],
   }).catch(err => { browserPromise = null; throw err; });
   return browserPromise;
