@@ -31,7 +31,8 @@ export async function processMedia(name, blob) {
   const type = mediaType(name);
   const info = { type, name, size: blob.size, ext: extOf(name) };
   try {
-    if (type === 'image') Object.assign(info, await processImage(blob, 1100, 'image/jpeg'));
+    // About twice the printed size: sharp in the PDF, while keeping the PDF server's memory low.
+    if (type === 'image') Object.assign(info, await processImage(blob, 720, 'image/jpeg'));
     else if (type === 'sticker') Object.assign(info, await processImage(blob, 300, 'image/png'));
     else if (type === 'video') Object.assign(info, await processVideo(blob));
     else if (type === 'audio') Object.assign(info, await processAudio(blob), { voice: isVoiceNote(name) });
@@ -47,15 +48,26 @@ export async function processMedia(name, blob) {
 
 async function processImage(blob, maxDim, mime) {
   const bmp = await createImageBitmap(blob, { imageOrientation: 'from-image' });
-  const scale = Math.min(1, maxDim / Math.max(bmp.width, bmp.height));
-  const w = Math.max(1, Math.round(bmp.width * scale));
-  const h = Math.max(1, Math.round(bmp.height * scale));
+  try {
+    const full = drawScaled(bmp, bmp.width, bmp.height, maxDim / Math.max(bmp.width, bmp.height), mime);
+    if (mime !== 'image/jpeg') return full;
+    // Album cells print as ~150px squares, so they get a much lighter copy.
+    const thumb = drawScaled(bmp, bmp.width, bmp.height, THUMB_SHORT_SIDE / Math.min(bmp.width, bmp.height), mime);
+    return { ...full, thumb: thumb.src };
+  } finally { bmp.close?.(); }
+}
+
+const THUMB_SHORT_SIDE = 320;
+
+function drawScaled(source, sw, sh, scale, mime) {
+  scale = Math.min(1, scale);
+  const w = Math.max(1, Math.round(sw * scale));
+  const h = Math.max(1, Math.round(sh * scale));
   const canvas = document.createElement('canvas');
   canvas.width = w; canvas.height = h;
   const ctx = canvas.getContext('2d');
   if (mime === 'image/jpeg') { ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h); }
-  ctx.drawImage(bmp, 0, 0, w, h);
-  bmp.close?.();
+  ctx.drawImage(source, 0, 0, w, h);
   return { src: canvas.toDataURL(mime, 0.82), w, h };
 }
 
@@ -77,13 +89,11 @@ async function processVideo(blob) {
     if (target > 0) {
       await withTimeout(new Promise(res => { video.onseeked = res; video.currentTime = target; }), 8000, 'video seek');
     }
-    const scale = Math.min(1, 800 / Math.max(video.videoWidth, video.videoHeight));
-    const w = Math.round(video.videoWidth * scale), h = Math.round(video.videoHeight * scale);
-    if (!w || !h) return { duration };
-    const canvas = document.createElement('canvas');
-    canvas.width = w; canvas.height = h;
-    canvas.getContext('2d').drawImage(video, 0, 0, w, h);
-    return { src: canvas.toDataURL('image/jpeg', 0.8), w, h, duration };
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if (!vw || !vh) return { duration };
+    const full = drawScaled(video, vw, vh, 720 / Math.max(vw, vh), 'image/jpeg');
+    const thumb = drawScaled(video, vw, vh, THUMB_SHORT_SIDE / Math.min(vw, vh), 'image/jpeg');
+    return { ...full, thumb: thumb.src, duration };
   } finally {
     video.removeAttribute('src'); video.load();
     URL.revokeObjectURL(url);
@@ -127,7 +137,7 @@ async function processPdf(blob) {
     const pages = doc.numPages;
     const page = await doc.getPage(1);
     const vp1 = page.getViewport({ scale: 1 });
-    const viewport = page.getViewport({ scale: 700 / vp1.width });
+    const viewport = page.getViewport({ scale: 560 / vp1.width });
     const canvas = document.createElement('canvas');
     canvas.width = Math.round(viewport.width); canvas.height = Math.round(viewport.height);
     const ctx = canvas.getContext('2d');

@@ -142,7 +142,7 @@ function formatText(text) {
   return html.replace(/\u0000(\d+)\u0000/g, (_, i) => links[+i]);
 }
 
-export function renderChat(chat, opts) {
+function buildChat(chat, opts) {
   const { title, me, messages, uses12h } = chat;
   const locale = opts.locale || 'en-GB';
   const dayFmt = new Intl.DateTimeFormat(locale, { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
@@ -192,15 +192,18 @@ export function renderChat(chat, opts) {
     items.push(m);
   }
 
+  // Each block remembers its day heading, so a part that starts mid-day can repeat it.
+  let dayHtml = '';
   for (const m of items) {
     const dayKey = m.date.toDateString();
     if (dayKey !== lastDay) {
-      out.push(`<div class="day"><span>${esc(dayFmt.format(m.date))}</span></div>`);
+      dayHtml = `<div class="day"><span>${esc(dayFmt.format(m.date))}</span></div>`;
+      out.push({ html: dayHtml, dayHtml, isDay: true });
       lastDay = dayKey; lastSender = null;
     }
     if (m.system) {
       const lock = /encrypted|מוצפנות/i.test(m.text) ? ICON.lock + ' ' : '';
-      out.push(`<div class="sys"><span>${lock}${esc(m.text)}</span></div>`);
+      out.push({ html: `<div class="sys"><span>${lock}${esc(m.text)}</span></div>`, dayHtml });
       lastSender = null;
       continue;
     }
@@ -210,9 +213,18 @@ export function renderChat(chat, opts) {
     const showName = !isOut && firstOfRun && (isGroup || opts.showNames !== false);
     const sender = showName ? `<div class="sender" style="color:${colorOf(m.sender)}">${esc(m.sender)}</div>` : '';
     const rowCls = `row ${isOut ? 'out' : 'in'}${firstOfRun ? ' first' : ''}`;
-    out.push(renderMessage(m, { rowCls, sender, meta, textBlock }));
+    out.push({ html: renderMessage(m, { rowCls, sender, meta, textBlock }), dayHtml });
   }
 
+  return {
+    title,
+    head: `<div class="head"><div class="avatar">${ICON.person}</div><div><div class="title">${esc(title)}</div><div class="sub">${esc(sub)}</div></div></div>`,
+    blocks: out,
+    end: `<div class="end">Exported WhatsApp chat · generated ${esc(shortFmt.format(new Date()))}</div>`,
+  };
+}
+
+function htmlPage(title, head, body) {
   return `<!doctype html>
 <html><head><meta charset="utf-8">
 <title>${esc(title)}</title>
@@ -222,11 +234,36 @@ export function renderChat(chat, opts) {
 <link rel="stylesheet" href="fonts/noto-sans/700.css">
 <style>${CHAT_CSS}</style></head>
 <body><div class="chat">
-<div class="head"><div class="avatar">${ICON.person}</div><div><div class="title">${esc(title)}</div><div class="sub">${esc(sub)}</div></div></div>
+${head}
 <div class="msgs">
-${out.join('\n')}
-<div class="end">Exported WhatsApp chat · generated ${esc(shortFmt.format(new Date()))}</div>
+${body}
 </div></div></body></html>`;
+}
+
+// The whole chat as one page (for the preview and the browser's print dialog).
+export function renderChat(chat, opts) {
+  const { title, head, blocks, end } = buildChat(chat, opts);
+  return htmlPage(title, head, blocks.map(b => b.html).join('\n') + '\n' + end);
+}
+
+// The chat split into several pages of roughly `budget` characters each (photos make up most of that),
+// so the PDF server only ever holds one part in memory. Parts break at a new day when possible,
+// and at any message once a single day grows past twice the budget.
+export function renderChatParts(chat, opts, budget = 2_000_000) {
+  const { title, head, blocks, end } = buildChat(chat, opts);
+  const parts = [];
+  let cur = [], size = 0;
+  for (const b of blocks) {
+    if (cur.length && ((b.isDay && size >= budget) || size + b.html.length > budget * 2)) {
+      parts.push(cur);
+      cur = b.isDay ? [] : [b.dayHtml];
+      size = 0;
+    }
+    cur.push(b.html);
+    size += b.html.length;
+  }
+  parts.push(cur);
+  return parts.map((p, i) => htmlPage(title, i === 0 ? head : '', p.join('\n') + (i === parts.length - 1 ? '\n' + end : '')));
 }
 
 function renderMessage(m, { rowCls, sender, meta, textBlock }) {
@@ -249,7 +286,7 @@ function renderMessage(m, { rowCls, sender, meta, textBlock }) {
 
   // Attachments
   if (m.album) {
-    const cells = m.album.map(x => `<div class="cell"><img src="${x.media.src}" alt="">${x.media.type === 'video' ? `<div class="vbadge"><div class="playbtn" style="position:static;transform:none">${ICON.play}</div></div>` : ''}</div>`).join('');
+    const cells = m.album.map(x => `<div class="cell"><img src="${x.media.thumb || x.media.src}" alt="">${x.media.type === 'video' ? `<div class="vbadge"><div class="playbtn" style="position:static;transform:none">${ICON.play}</div></div>` : ''}</div>`).join('');
     return wrap(`<div class="album">${cells}</div><div class="meta-line"></div>${meta(m)}`, 'media');
   }
   const f = m.media;

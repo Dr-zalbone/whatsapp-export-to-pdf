@@ -13,53 +13,59 @@ const app = express();
 app.use(express.static(path.join(root, 'public')));
 app.use('/vendor/jszip', express.static(modules('jszip/dist')));
 app.use('/vendor/pdfjs', express.static(modules('pdfjs-dist/build')));
+app.use('/vendor/pdf-lib', express.static(modules('pdf-lib/dist')));
 app.use('/fonts', express.static(modules('@fontsource')));
 
-let browserPromise;
-function getBrowser() {
-  browserPromise ??= puppeteer.launch({
-    // A system Chrome/Chromium (set by the Dockerfile) runs in new headless mode; locally we use Puppeteer's headless shell.
-    headless: process.env.PUPPETEER_EXECUTABLE_PATH ? true : 'shell',
-    args: process.platform === 'linux' ? ['--no-sandbox', '--disable-dev-shm-usage'] : [],
-  }).catch(err => { browserPromise = null; throw err; });
-  return browserPromise;
+// Small hosts (Render free: 512 MB) cannot hold two renders at once, so PDFs are made one at a time
+// in a fresh Chrome that is closed afterwards, returning its memory between jobs.
+let queue = Promise.resolve();
+function withBrowser(job) {
+  const run = queue.then(async () => {
+    const browser = await puppeteer.launch({
+      // A system Chrome/Chromium (set by the Dockerfile) runs in new headless mode; locally we use Puppeteer's headless shell.
+      headless: process.env.PUPPETEER_EXECUTABLE_PATH ? true : 'shell',
+      args: process.platform === 'linux'
+        ? ['--no-sandbox', '--disable-dev-shm-usage', '--single-process', '--no-zygote', '--disable-gpu', '--disable-extensions']
+        : [],
+    });
+    try { return await job(browser); }
+    finally { await browser.close().catch(() => {}); }
+  });
+  queue = run.catch(() => {});
+  return run;
 }
 
-app.post('/api/pdf', express.text({ type: 'text/html', limit: '1gb' }), async (req, res) => {
+app.post('/api/pdf', express.text({ type: 'text/html', limit: '200mb' }), async (req, res) => {
   const html = req.body;
   if (typeof html !== 'string' || !html.includes('class="chat"')) return res.status(400).send('Expected the generated chat page.');
 
   const origin = `http://127.0.0.1:${PORT}`;
-  let page;
   try {
-    const browser = await getBrowser();
-    page = await browser.newPage();
-    // The page is only data: images, inline CSS and our bundled fonts; block everything else.
-    await page.setJavaScriptEnabled(false);
-    await page.setRequestInterception(true);
-    page.on('request', r => {
-      const url = r.url();
-      if (url.startsWith('data:') || url.startsWith(origin + '/fonts/') || url === 'about:blank') r.continue();
-      else r.abort();
-    });
-    const withBase = html.replace(/<head>/i, `<head><base href="${origin}/">`);
-    await page.setContent(withBase, { waitUntil: 'load', timeout: 0 });
-    await page.evaluateHandle('document.fonts.ready').catch(() => {});
-    const pdf = await page.pdf({
-      format: 'A4',
-      printBackground: true,
-      preferCSSPageSize: true,
-      displayHeaderFooter: true,
-      headerTemplate: '<div></div>',
-      footerTemplate: '<div style="width:100%;text-align:center;font-size:8px;color:#8696a0;font-family:Arial,sans-serif"><span class="pageNumber"></span> / <span class="totalPages"></span></div>',
-      timeout: 0,
+    const pdf = await withBrowser(async browser => {
+      const page = await browser.newPage();
+      // The page is only data: images, inline CSS and our bundled fonts; block everything else.
+      await page.setJavaScriptEnabled(false);
+      await page.setRequestInterception(true);
+      page.on('request', r => {
+        const url = r.url();
+        if (url.startsWith('data:') || url.startsWith(origin + '/fonts/') || url === 'about:blank') r.continue();
+        else r.abort();
+      });
+      const withBase = html.replace(/<head>/i, `<head><base href="${origin}/">`);
+      await page.setContent(withBase, { waitUntil: 'load', timeout: 0 });
+      await page.evaluateHandle('document.fonts.ready').catch(() => {});
+      return page.pdf({
+        format: 'A4',
+        printBackground: true,
+        preferCSSPageSize: true,
+        // No footer here: the browser numbers the pages after joining all parts.
+        timeout: 0,
+      });
     });
     res.set('Content-Type', 'application/pdf').send(Buffer.from(pdf));
   } catch (err) {
     console.error(err);
     res.status(500).send('PDF generation failed: ' + err.message);
-  } finally {
-    page?.close().catch(() => {});
   }
 });
 

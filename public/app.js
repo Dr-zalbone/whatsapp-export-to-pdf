@@ -1,6 +1,6 @@
 import { parseChat, chatNameFromFilename, classify } from './parser.js';
 import { processMedia } from './media.js';
-import { renderChat } from './render.js';
+import { renderChat, renderChatParts } from './render.js';
 
 const $ = sel => document.querySelector(sel);
 const state = { chat: null, html: '', fileBase: 'whatsapp-chat' };
@@ -134,8 +134,28 @@ function defaultTitle(senders, chatName, me) {
 function rerender() {
   if (!state.chat) return;
   const chat = { ...state.chat, me: $('#me').value, title: $('#title').value.trim() || 'WhatsApp chat' };
-  state.html = renderChat(chat, { locale: $('#locale').value });
+  state.renderArgs = [chat, { locale: $('#locale').value }];
+  state.html = renderChat(...state.renderArgs);
   $('#preview').srcdoc = state.html;
+}
+
+// Prints one part on the server, retrying while a restarting server answers 502/503 or drops the connection.
+async function printPart(html) {
+  for (let attempt = 1; ; attempt++) {
+    let res;
+    try {
+      res = await fetch('api/pdf', { method: 'POST', headers: { 'Content-Type': 'text/html; charset=utf-8' }, body: html });
+    } catch (err) {
+      if (attempt >= 3) throw err;
+    }
+    if (res?.ok) return res.arrayBuffer();
+    if (res && ![502, 503, 504].includes(res.status)) {
+      const text = /text\/plain/.test(res.headers.get('content-type') || '') ? await res.text() : '';
+      throw new Error(text || `Server error ${res.status}`);
+    }
+    if (attempt >= 3) throw new Error(`Server error ${res ? res.status : 'no response'}`);
+    await new Promise(r => setTimeout(r, 15000));
+  }
 }
 
 async function downloadPdf() {
@@ -145,9 +165,24 @@ async function downloadPdf() {
   btn.textContent = 'Creating PDF…';
   $('#error').hidden = true;
   try {
-    const res = await fetch('api/pdf', { method: 'POST', headers: { 'Content-Type': 'text/html; charset=utf-8' }, body: state.html });
-    if (!res.ok) throw new Error((await res.text()) || `Server error ${res.status}`);
-    const blob = await res.blob();
+    // The server prints the chat in parts to keep its memory use flat; the parts are joined here.
+    const parts = renderChatParts(...state.renderArgs);
+    const { PDFDocument, StandardFonts, rgb } = PDFLib;
+    const merged = await PDFDocument.create();
+    for (let i = 0; i < parts.length; i++) {
+      btn.textContent = parts.length > 1 ? `Creating PDF… part ${i + 1} of ${parts.length}` : 'Creating PDF…';
+      const part = await PDFDocument.load(await printPart(parts[i]));
+      for (const page of await merged.copyPages(part, part.getPageIndices())) merged.addPage(page);
+    }
+    const font = await merged.embedFont(StandardFonts.Helvetica);
+    const pages = merged.getPages();
+    pages.forEach((page, i) => {
+      const text = `${i + 1} / ${pages.length}`;
+      const size = 7;
+      page.drawText(text, { x: (page.getWidth() - font.widthOfTextAtSize(text, size)) / 2, y: 16, size, font, color: rgb(0.53, 0.59, 0.63) });
+    });
+    merged.setTitle(state.renderArgs[0].title);
+    const blob = new Blob([await merged.save()], { type: 'application/pdf' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = `WhatsApp – ${state.fileBase}.pdf`;
