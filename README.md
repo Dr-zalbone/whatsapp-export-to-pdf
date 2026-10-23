@@ -19,6 +19,16 @@ Then open http://localhost:3000. Set `PORT` / `HOST` (e.g. `HOST=0.0.0.0`) to ch
 
 Hebrew and other right-to-left text is laid out per paragraph (`unicode-bidi: plaintext`), so Hebrew, English and numbers mixed in one message keep the right order, and the timestamp sits at the end of the last line like in WhatsApp. Noto Sans Hebrew is bundled so output looks the same on any server.
 
-## Deploying on Linux
+## Deploying on Render
 
-Install an emoji font so emoji render in the PDF, e.g. `apt-get install fonts-noto-color-emoji`, plus the usual Chrome dependencies Puppeteer lists.
+The `Dockerfile` installs Chrome's libraries and fonts; `render.yaml` describes a free Docker web service.
+
+1. Push this folder to a GitHub repository (private is fine).
+2. In Render: **New › Blueprint**, pick the repository, and apply. (Or **New › Web Service**, pick the repo, runtime Docker, instance type Free.)
+3. When it is live, open the service › **Settings › Custom Domains**, add `pdf.yourdomain.com`, and create the `CNAME` record Render shows at your DNS provider. HTTPS is issued automatically.
+
+The free instance has 512 MB of RAM and sleeps after 15 minutes without traffic (the next visit takes about a minute to wake).
+
+## Deploying elsewhere on Linux
+
+Use the `Dockerfile`, or install the same packages it lists (Chrome libraries and `fonts-noto-color-emoji`) and run with `HOST=0.0.0.0`.

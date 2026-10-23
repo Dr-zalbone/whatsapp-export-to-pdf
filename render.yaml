@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: whatsapp-to-pdf
+    runtime: docker
+    plan: free
+    healthCheckPath: /
