@@ -1,9 +1,10 @@
 FROM node:24-bookworm-slim
 
-# Debian's Chromium brings its own shared libraries; the fonts make emoji and non-Latin text render in the PDF.
+# Debian's Chromium brings its own shared libraries. The chat's text fonts are embedded by server.js;
+# these system fonts only cover emoji and scripts the bundled fonts lack.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates chromium \
-      fonts-noto-color-emoji fonts-noto-core fonts-dejavu-core \
+      fonts-noto-color-emoji fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

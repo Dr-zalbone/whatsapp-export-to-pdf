@@ -140,8 +140,9 @@ function rerender() {
 }
 
 // Prints one part on the server, retrying while a restarting server answers 502/503 or drops the connection.
-async function printPart(html) {
+async function printPart(html, onRetry) {
   for (let attempt = 1; ; attempt++) {
+    if (attempt > 1) onRetry();
     let res;
     try {
       res = await fetch('api/pdf', { method: 'POST', headers: { 'Content-Type': 'text/html; charset=utf-8' }, body: html });
@@ -158,22 +159,46 @@ async function printPart(html) {
   }
 }
 
+// Progress under the Download button: a bar (indeterminate when value is null) and a status line with elapsed time.
+function pdfProgress(started) {
+  const box = $('#pdf-progress'), bar = box.querySelector('progress'), line = box.querySelector('.ptext');
+  let text = '';
+  const paint = () => {
+    const s = Math.round((Date.now() - started) / 1000);
+    line.textContent = `${text} · ${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+  };
+  const timer = setInterval(paint, 1000);
+  box.hidden = false;
+  return {
+    set(newText, value) {
+      text = newText;
+      if (value == null) bar.removeAttribute('value'); else bar.value = value;
+      paint();
+    },
+    done() { clearInterval(timer); box.hidden = true; },
+  };
+}
+
 async function downloadPdf() {
   const btn = $('#download');
   btn.disabled = true;
   const label = btn.textContent;
   btn.textContent = 'Creating PDF…';
   $('#error').hidden = true;
+  const progress = pdfProgress(Date.now());
   try {
     // The server prints the chat in parts to keep its memory use flat; the parts are joined here.
     const parts = renderChatParts(...state.renderArgs);
     const { PDFDocument, StandardFonts, rgb } = PDFLib;
     const merged = await PDFDocument.create();
     for (let i = 0; i < parts.length; i++) {
-      btn.textContent = parts.length > 1 ? `Creating PDF… part ${i + 1} of ${parts.length}` : 'Creating PDF…';
-      const part = await PDFDocument.load(await printPart(parts[i]));
+      const step = `Printing part ${i + 1} of ${parts.length}`;
+      progress.set(step + '…', parts.length > 1 ? i / parts.length : null);
+      const pdf = await printPart(parts[i], () => progress.set(`${step}: server is restarting, retrying…`, parts.length > 1 ? i / parts.length : null));
+      const part = await PDFDocument.load(pdf);
       for (const page of await merged.copyPages(part, part.getPageIndices())) merged.addPage(page);
     }
+    progress.set('Joining pages…', 1);
     const font = await merged.embedFont(StandardFonts.Helvetica);
     const pages = merged.getPages();
     pages.forEach((page, i) => {
@@ -193,6 +218,7 @@ async function downloadPdf() {
   } catch (err) {
     showError(`Could not create the PDF on the server (${err.message}). You can still use "Print / Save as PDF".`);
   } finally {
+    progress.done();
     btn.disabled = false;
     btn.textContent = label;
   }
