@@ -1,9 +1,10 @@
 import { parseChat, chatNameFromFilename, classify } from './parser.js';
 import { processMedia } from './media.js';
 import { renderChat, renderChatParts } from './render.js';
+import { buildPackage } from './package.js';
 
 const $ = sel => document.querySelector(sel);
-const state = { chat: null, html: '', fileBase: 'whatsapp-chat' };
+const state = { chat: null, html: '', fileBase: 'whatsapp-chat', previewMode: 'pdf' };
 
 const drop = $('#drop'), input = $('#file');
 drop.addEventListener('click', () => input.click());
@@ -16,8 +17,10 @@ drop.addEventListener('drop', e => e.dataTransfer.files[0] && handleFile(e.dataT
 $('#me').addEventListener('change', rerender);
 $('#locale').addEventListener('change', rerender);
 $('#title').addEventListener('input', debounce(rerender, 300));
+$('#package').addEventListener('click', downloadPackage);
 $('#download').addEventListener('click', downloadPdf);
-$('#print').addEventListener('click', () => $('#preview').contentWindow.print());
+$('#print').addEventListener('click', printPdfLayout);
+document.querySelectorAll('[data-preview]').forEach(b => b.addEventListener('click', () => setPreviewMode(b.dataset.preview)));
 $('#reset').addEventListener('click', () => location.reload());
 
 function setStatus(text, progress = null) {
@@ -41,16 +44,18 @@ async function handleFile(file) {
   $('#error').hidden = true;
   drop.classList.add('busy');
   try {
-    let txtName, txtContent, files = new Map();
+    let txtName, txtContent, files = new Map(), originals;
     if (/\.txt$/i.test(file.name)) {
       txtName = file.name;
       txtContent = await file.text();
+      originals = [{ path: file.name, read: async () => new Uint8Array(await file.arrayBuffer()) }];
     } else {
       setStatus('Opening ZIP…');
       if (!window.JSZip) throw new Error('ZIP library failed to load.');
       const zip = await JSZip.loadAsync(file);
       const entries = Object.values(zip.files).filter(f => !f.dir && !/(^|\/)(__MACOSX|\.)/.test(f.name));
       for (const e of entries) files.set(baseName(e.name).toLowerCase(), e);
+      originals = entries.map(e => ({ path: e.name, read: () => e.async('uint8array') }));
       const txts = entries.filter(e => /\.txt$/i.test(e.name));
       if (!txts.length) throw new Error('No chat .txt file found in this ZIP. Export the chat from WhatsApp (⋮ › More › Export chat › Include media) and upload the ZIP it creates.');
       // Prefer the WhatsApp chat file over any .txt that was shared inside the chat.
@@ -62,20 +67,28 @@ async function handleFile(file) {
     setStatus('Reading messages…');
     const parsed = parseChat(txtContent);
     const exists = name => files.has(baseName(name.trim()).toLowerCase());
-    for (const m of parsed.messages) if (!m.system) Object.assign(m, classify(m, exists));
+    let no = 0;
+    for (const m of parsed.messages) {
+      if (m.system) continue;
+      Object.assign(m, classify(m, exists));
+      m.no = ++no;   // message number, as cited in court (#1, #2, …)
+    }
 
     const referenced = [...new Set(parsed.messages.filter(m => m.kind === 'file' && m.exists).map(m => m.file))];
-    const media = new Map();
+    // name in the chat -> { name, path inside the export, processed media, blob URL for the site's viewer preview }
+    const refs = new Map();
     let done = 0;
     setStatus(`Processing media (0 / ${referenced.length})…`, 0);
     await runPool(referenced, 4, async name => {
       const entry = files.get(baseName(name).toLowerCase());
       const blob = await entry.async('blob');
-      media.set(name, await processMedia(baseName(entry.name), blob));
+      const media = await processMedia(baseName(entry.name), blob);
+      refs.set(name, { name, path: entry.name, media, url: URL.createObjectURL(blob) });
       done++;
       setStatus(`Processing media (${done} / ${referenced.length})…`, done / referenced.length);
     });
-    for (const m of parsed.messages) if (m.kind === 'file' && m.exists) m.media = media.get(m.file);
+    for (const m of parsed.messages) if (m.kind === 'file' && m.exists) m.media = refs.get(m.file).media;
+    Object.assign(state, { refs, originals, sourceFile: file, txtName });
 
     const chatName = chatNameFromFilename(txtName) || chatNameFromFilename(file.name);
     const me = guessMe(parsed, chatName);
@@ -136,7 +149,28 @@ function rerender() {
   const chat = { ...state.chat, me: $('#me').value, title: $('#title').value.trim() || 'WhatsApp chat' };
   state.renderArgs = [chat, { locale: $('#locale').value }];
   state.html = renderChat(...state.renderArgs);
-  $('#preview').srcdoc = state.html;
+  showPreview();
+}
+
+// The preview shows either the PDF layout or the interactive viewer (media playing from blob: URLs).
+function showPreview() {
+  const [chat, opts] = state.renderArgs;
+  $('#preview').srcdoc = state.previewMode === 'viewer'
+    ? renderChat(chat, { ...opts, viewer: true, fileUrl: name => state.refs.get(name)?.url ?? '' })
+    : state.html;
+}
+
+function setPreviewMode(mode) {
+  state.previewMode = mode;
+  document.querySelectorAll('[data-preview]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.preview === mode)));
+  if (state.chat) showPreview();
+}
+
+function printPdfLayout() {
+  const frame = $('#preview');
+  if (state.previewMode === 'pdf') return frame.contentWindow.print();
+  frame.addEventListener('load', () => frame.contentWindow.print(), { once: true });
+  setPreviewMode('pdf');
 }
 
 // Prints one part on the server, retrying while a restarting server answers 502/503 or drops the connection.
@@ -179,49 +213,82 @@ function pdfProgress(started) {
   };
 }
 
-async function downloadPdf() {
-  const btn = $('#download');
-  btn.disabled = true;
+// The server prints the chat in parts to keep its memory use flat; the parts are joined and numbered here.
+async function createPdf(progress) {
+  const parts = renderChatParts(...state.renderArgs);
+  const { PDFDocument, StandardFonts, rgb } = PDFLib;
+  const merged = await PDFDocument.create();
+  for (let i = 0; i < parts.length; i++) {
+    const step = `Printing part ${i + 1} of ${parts.length}`;
+    progress.set(step + '…', parts.length > 1 ? i / parts.length : null);
+    const pdf = await printPart(parts[i], () => progress.set(`${step}: server is restarting, retrying…`, parts.length > 1 ? i / parts.length : null));
+    const part = await PDFDocument.load(pdf);
+    for (const page of await merged.copyPages(part, part.getPageIndices())) merged.addPage(page);
+  }
+  progress.set('Joining pages…', 1);
+  const font = await merged.embedFont(StandardFonts.Helvetica);
+  const pages = merged.getPages();
+  pages.forEach((page, i) => {
+    const text = `${i + 1} / ${pages.length}`;
+    const size = 7;
+    page.drawText(text, { x: (page.getWidth() - font.widthOfTextAtSize(text, size)) / 2, y: 16, size, font, color: rgb(0.53, 0.59, 0.63) });
+  });
+  merged.setTitle(state.renderArgs[0].title);
+  return merged.save();
+}
+
+function saveFile(blob, name) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+}
+
+// Runs one download job with the buttons locked and the progress bar showing.
+async function runJob(btn, busyLabel, job) {
+  const buttons = [$('#package'), $('#download')];
+  buttons.forEach(b => { b.disabled = true; });
   const label = btn.textContent;
-  btn.textContent = 'Creating PDF…';
+  btn.textContent = busyLabel;
   $('#error').hidden = true;
   const progress = pdfProgress(Date.now());
   try {
-    // The server prints the chat in parts to keep its memory use flat; the parts are joined here.
-    const parts = renderChatParts(...state.renderArgs);
-    const { PDFDocument, StandardFonts, rgb } = PDFLib;
-    const merged = await PDFDocument.create();
-    for (let i = 0; i < parts.length; i++) {
-      const step = `Printing part ${i + 1} of ${parts.length}`;
-      progress.set(step + '…', parts.length > 1 ? i / parts.length : null);
-      const pdf = await printPart(parts[i], () => progress.set(`${step}: server is restarting, retrying…`, parts.length > 1 ? i / parts.length : null));
-      const part = await PDFDocument.load(pdf);
-      for (const page of await merged.copyPages(part, part.getPageIndices())) merged.addPage(page);
-    }
-    progress.set('Joining pages…', 1);
-    const font = await merged.embedFont(StandardFonts.Helvetica);
-    const pages = merged.getPages();
-    pages.forEach((page, i) => {
-      const text = `${i + 1} / ${pages.length}`;
-      const size = 7;
-      page.drawText(text, { x: (page.getWidth() - font.widthOfTextAtSize(text, size)) / 2, y: 16, size, font, color: rgb(0.53, 0.59, 0.63) });
-    });
-    merged.setTitle(state.renderArgs[0].title);
-    const blob = new Blob([await merged.save()], { type: 'application/pdf' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `WhatsApp – ${state.fileBase}.pdf`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+    await job(progress);
   } catch (err) {
-    showError(`Could not create the PDF on the server (${err.message}). You can still use "Print / Save as PDF".`);
+    console.error(err);
+    showError(err.message || String(err));
   } finally {
     progress.done();
-    btn.disabled = false;
+    buttons.forEach(b => { b.disabled = false; });
     btn.textContent = label;
   }
+}
+
+function downloadPdf() {
+  return runJob($('#download'), 'Creating PDF…', async progress => {
+    let pdf;
+    try { pdf = await createPdf(progress); }
+    catch (err) { throw new Error(`Could not create the PDF on the server (${err.message}). You can still use "Print / Save as PDF".`); }
+    saveFile(new Blob([pdf], { type: 'application/pdf' }), `WhatsApp – ${state.fileBase}.pdf`);
+  });
+}
+
+function downloadPackage() {
+  return runJob($('#package'), 'Creating package…', async progress => {
+    let pdf;
+    try { pdf = await createPdf(progress); }
+    catch (err) { throw new Error(`Could not create the PDF on the server (${err.message}), so the package was not made. Try again in a minute.`); }
+    const [chat, opts] = state.renderArgs;
+    const zip = await buildPackage({
+      sourceFile: state.sourceFile, originals: state.originals, referenced: state.refs,
+      chat, opts, pdf, txtName: state.txtName,
+      progress: (text, value) => progress.set(text, value),
+    });
+    saveFile(zip, `WhatsApp – ${state.fileBase} – evidence package.zip`);
+  });
 }
 
 async function runPool(items, size, fn) {

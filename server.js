@@ -15,6 +15,7 @@ app.use(express.static(path.join(root, 'public')));
 app.use('/vendor/jszip', express.static(modules('jszip/dist')));
 app.use('/vendor/pdfjs', express.static(modules('pdfjs-dist/build')));
 app.use('/vendor/pdf-lib', express.static(modules('pdf-lib/dist')));
+app.use('/vendor/lamejs', express.static(modules('@breezystack/lamejs/dist')));
 app.use('/fonts', express.static(modules('@fontsource')));
 
 // The printed page is loaded from a string, so it has no origin and Chrome blocks web fonts fetched

@@ -54,6 +54,7 @@ body {
 .media .meta { bottom: 6px; right: 10px; }
 .media .meta.rtl { left: 10px; }
 .meta .ticks { color: #53bdeb; }
+.meta .no { color: #a0abb2; margin-right: 3px; font-variant-numeric: tabular-nums; }
 .meta.overlay { color: #fff; text-shadow: 0 0 3px rgba(0,0,0,.6); }
 .meta.overlay .ticks { color: #fff; }
 .meta-line { height: 16px; }
@@ -159,11 +160,14 @@ function buildChat(chat, opts) {
     `${counted.length} messages`,
   ].filter(Boolean).join(' · ');
 
+  // Message numbers (#n, assigned by the app) let a court refer to any message; an album shows its range.
+  const numberOf = m => m.album ? `${m.album[0].no}–${m.album[m.album.length - 1].no}` : m.no;
   const meta = (m, { rtl = false, overlay = false } = {}) => {
     const out = m.sender === me;
-    return `<div class="meta${rtl ? ' rtl' : ''}${overlay ? ' overlay' : ''}">${m.edited ? 'Edited ' : ''}${esc(timeFmt.format(m.date))}${out ? ICON.ticks : ''}</div>`;
+    const no = numberOf(m);
+    return `<div class="meta${rtl ? ' rtl' : ''}${overlay ? ' overlay' : ''}">${no ? `<span class="no">#${no}</span>` : ''}${m.edited ? 'Edited ' : ''}${esc(timeFmt.format(m.date))}${out ? ICON.ticks : ''}</div>`;
   };
-  const metaWidth = m => (m.edited ? 38 : 0) + (uses12h ? 52 : 34) + (m.sender === me ? 20 : 0);
+  const metaWidth = m => (m.edited ? 38 : 0) + (uses12h ? 52 : 34) + (m.sender === me ? 20 : 0) + String(numberOf(m) ?? '').length * 6 + 12;
   const textBlock = (m, text) => text
     ? `<div class="text">${formatText(text)}<span class="spacer" style="width:${metaWidth(m) + 6}px"></span></div>`
     : '';
@@ -172,10 +176,12 @@ function buildChat(chat, opts) {
   let lastDay = '', lastSender = null;
 
   // Group runs of consecutive images/videos without captions from the same sender into an album.
+  // The viewer keeps videos out of albums so each gets a full-size player.
+  const albumTypes = opts.viewer ? ['image'] : ['image', 'video'];
   const items = [];
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i];
-    const albumable = x => x && !x.system && x.kind === 'file' && x.media && ['image', 'video'].includes(x.media.type) && x.media.src && !x.text;
+    const albumable = x => x && !x.system && x.kind === 'file' && x.media && albumTypes.includes(x.media.type) && x.media.src && !x.text;
     if (albumable(m)) {
       const group = [m];
       while (albumable(messages[i + 1]) && messages[i + 1].sender === m.sender &&
@@ -213,7 +219,7 @@ function buildChat(chat, opts) {
     const showName = !isOut && firstOfRun && (isGroup || opts.showNames !== false);
     const sender = showName ? `<div class="sender" style="color:${colorOf(m.sender)}">${esc(m.sender)}</div>` : '';
     const rowCls = `row ${isOut ? 'out' : 'in'}${firstOfRun ? ' first' : ''}`;
-    out.push({ html: renderMessage(m, { rowCls, sender, meta, textBlock }), dayHtml });
+    out.push({ html: renderMessage(m, { rowCls, sender, meta, textBlock, opts }), dayHtml });
   }
 
   return {
@@ -224,26 +230,71 @@ function buildChat(chat, opts) {
   };
 }
 
-function htmlPage(title, head, body) {
+const VIEWER_CSS = `
+.vbar { position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; padding: 8px 16px; background: #f0f2f5; border-bottom: 1px solid #d1d7db; font-size: 9pt; color: #54656f; }
+.vbar form { display: flex; gap: 6px; align-items: center; margin: 0; }
+.vbar input { width: 70px; padding: 4px 6px; border: 1px solid #d1d7db; border-radius: 6px; font: inherit; }
+.vbar button { padding: 4px 10px; border: 0; border-radius: 6px; background: #00a884; color: #fff; font: inherit; cursor: pointer; }
+#goto-msg { color: #b42318; }
+#media-warning { background: #fdecea; color: #8a1c13; padding: 8px 16px; font-size: 9pt; line-height: 1.5; }
+a.open { color: inherit; text-decoration: none; display: block; }
+.album .cell a.open { height: 100%; }
+.fname a.open, .fname a.open:visited { display: inline; color: #027eb5; text-decoration: underline; }
+.video video { display: block; width: 100%; max-height: 420px; border-radius: 6px; background: #000; }
+.audio audio { flex: 1; min-width: 0; height: 40px; }
+.row.hit .bubble { outline: 3px solid #f5c542; }
+@media print { .vbar, #media-warning { display: none; } }
+`;
+
+// Offline viewer behaviour: warn when media files are missing (usually the ZIP was not extracted) and jump to #n.
+const VIEWER_JS = `
+(function () {
+  var warn = document.getElementById('media-warning');
+  document.addEventListener('error', function (e) {
+    var t = e.target, tag = t && t.tagName;
+    if (tag === 'IMG' || tag === 'VIDEO' || (tag === 'SOURCE' && !t.nextElementSibling)) warn.hidden = false;
+  }, true);
+  var form = document.getElementById('goto'), msg = document.getElementById('goto-msg');
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    var n = form.n.value.replace(/\\D/g, '');
+    var el = document.getElementById('m' + n);
+    if (!el) { msg.textContent = 'No message #' + n; return; }
+    msg.textContent = '';
+    var row = el.classList.contains('row') ? el : el.closest('.row');
+    document.querySelectorAll('.row.hit').forEach(function (r) { r.classList.remove('hit'); });
+    row.classList.add('hit');
+    row.scrollIntoView({ block: 'center' });
+  });
+})();
+`;
+
+function htmlPage(title, head, body, viewer = false) {
+  const bar = viewer ? `
+<div class="vbar"><span>Offline viewer · audio and video play here</span>
+<form id="goto"><label for="goto-n">Go to message #</label><input id="goto-n" name="n" inputmode="numeric" autocomplete="off"><button>Go</button><span id="goto-msg"></span></form></div>
+<div id="media-warning" hidden>Some media could not be loaded. If this file was opened from inside the ZIP, extract the whole ZIP first and open viewer.html from the extracted folder. A file in a format this browser cannot play can still be opened from the "original" folder.</div>` : '';
   return `<!doctype html>
 <html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)}</title>
 <link rel="stylesheet" href="fonts/noto-sans-hebrew/400.css">
 <link rel="stylesheet" href="fonts/noto-sans-hebrew/700.css">
 <link rel="stylesheet" href="fonts/noto-sans/400.css">
 <link rel="stylesheet" href="fonts/noto-sans/700.css">
-<style>${CHAT_CSS}</style></head>
+<style>${CHAT_CSS}${viewer ? VIEWER_CSS : ''}</style></head>
 <body><div class="chat">
-${head}
+${head}${bar}
 <div class="msgs">
 ${body}
-</div></div></body></html>`;
+</div></div>${viewer ? `<script>${VIEWER_JS}</script>` : ''}</body></html>`;
 }
 
-// The whole chat as one page (for the preview and the browser's print dialog).
+// The whole chat as one page: the PDF layout (preview, print dialog), or with opts.viewer the
+// interactive viewer whose media play from opts.fileUrl(name) / opts.playableUrl(name).
 export function renderChat(chat, opts) {
   const { title, head, blocks, end } = buildChat(chat, opts);
-  return htmlPage(title, head, blocks.map(b => b.html).join('\n') + '\n' + end);
+  return htmlPage(title, head, blocks.map(b => b.html).join('\n') + '\n' + end, !!opts.viewer);
 }
 
 // The chat split into several pages of roughly `budget` characters each (photos make up most of that),
@@ -266,9 +317,16 @@ export function renderChatParts(chat, opts, budget = 2_000_000) {
   return parts.map((p, i) => htmlPage(title, i === 0 ? head : '', p.join('\n') + (i === parts.length - 1 ? '\n' + end : '')));
 }
 
-function renderMessage(m, { rowCls, sender, meta, textBlock }) {
+function renderMessage(m, { rowCls, sender, meta, textBlock, opts }) {
   const rtl = lastLineIsRtl(m.text);
-  const wrap = (inner, cls = '') => `<div class="${rowCls}${m.album ? ' album-row' : ''}"><div class="bubble${cls ? ' ' + cls : ''}">${sender}${inner}</div></div>`;
+  const firstNo = m.album ? m.album[0].no : m.no;
+  // In the viewer every number in an album is a jump target, so "#7" finds the album holding it.
+  const ids = m.album ? m.album.slice(1).map(x => `<span id="m${x.no}"></span>`).join('') : '';
+  const wrap = (inner, cls = '') => `<div class="${rowCls}${m.album ? ' album-row' : ''}"${firstNo ? ` id="m${firstNo}"` : ''}>${ids}<div class="bubble${cls ? ' ' + cls : ''}">${sender}${inner}</div></div>`;
+  // Viewer mode: media link to the files in the package (or blob: URLs in the site preview).
+  const viewer = !!opts.viewer;
+  const fileUrl = name => esc(opts.fileUrl(name));
+  const linked = (name, inner) => viewer ? `<a class="open" href="${fileUrl(name)}" target="_blank" rel="noopener">${inner}</a>` : inner;
 
   if (m.kind === 'deleted') {
     return wrap(`<div class="text"><span class="note">${ICON.ban} ${esc(m.text)}</span><span class="spacer" style="width:60px"></span></div>${meta(m)}`);
@@ -286,7 +344,13 @@ function renderMessage(m, { rowCls, sender, meta, textBlock }) {
 
   // Attachments
   if (m.album) {
-    const cells = m.album.map(x => `<div class="cell"><img src="${x.media.thumb || x.media.src}" alt="">${x.media.type === 'video' ? `<div class="vbadge"><div class="playbtn" style="position:static;transform:none">${ICON.play}</div></div>` : ''}</div>`).join('');
+    const cells = m.album.map(x => {
+      const img = viewer
+        ? `<img src="${fileUrl(x.file)}" loading="lazy" alt="#${x.no}">`
+        : `<img src="${x.media.thumb || x.media.src}" alt="">`;
+      const badge = x.media.type === 'video' ? `<div class="vbadge"><div class="playbtn" style="position:static;transform:none">${ICON.play}</div></div>` : '';
+      return `<div class="cell">${linked(x.file, img)}${badge}</div>`;
+    }).join('');
     return wrap(`<div class="album">${cells}</div><div class="meta-line"></div>${meta(m)}`, 'media');
   }
   const f = m.media;
@@ -297,29 +361,42 @@ function renderMessage(m, { rowCls, sender, meta, textBlock }) {
   const tail = caption ? meta(m, { rtl }) : `<div class="meta-line"></div>${meta(m)}`;
 
   switch (f.type) {
-    case 'image':
-      return wrap(`<div class="single"><img src="${f.src}" alt=""></div>${caption}${tail}`, 'media');
+    case 'image': {
+      const img = viewer ? `<img src="${fileUrl(m.file)}" loading="lazy" alt="">` : `<img src="${f.src}" alt="">`;
+      return wrap(`<div class="single">${linked(m.file, img)}</div>${caption}${tail}`, 'media');
+    }
     case 'sticker':
-      return wrap(`<img src="${f.src}" alt="">${m.text ? textBlock(m, m.text) : ''}${meta(m)}`, 'sticker');
+      return wrap(`<img src="${viewer ? fileUrl(m.file) : f.src}" alt="">${m.text ? textBlock(m, m.text) : ''}${meta(m)}`, 'sticker');
     case 'video': {
+      if (viewer) {
+        const poster = f.src ? ` poster="${f.src}"` : '';
+        return wrap(`<div class="video"><video controls playsinline preload="metadata"${poster} src="${fileUrl(m.file)}"></video></div><div class="fname">${linked(m.file, esc(f.name))}</div>${caption}${tail}`, 'media');
+      }
       const dur = f.duration ? `<div class="vdur">▶ ${fmtDuration(f.duration)}</div>` : '';
       const frame = f.src ? `<img src="${f.src}" alt="">` : '<div class="noframe"></div>';
       return wrap(`<div class="video">${frame}<div class="playbtn">${ICON.play}</div>${dur}</div><div class="fname">${esc(f.name)}</div>${caption}${tail}`, 'media');
     }
     case 'audio': {
+      const icon = `<div class="icon${f.voice ? '' : ' file'}">${f.voice ? ICON.mic : ICON.headphones}</div>`;
+      if (viewer) {
+        // A converted MP3 (when there is one) comes first because every browser can play it.
+        const playable = opts.playableUrl?.(m.file);
+        const sources = (playable ? `<source src="${esc(playable)}" type="audio/mpeg">` : '') + `<source src="${fileUrl(m.file)}">`;
+        return wrap(`<div class="audio">${icon}<audio controls preload="metadata">${sources}</audio></div><div class="fname">${linked(m.file, esc(f.name))}${f.duration ? ' · ' + fmtDuration(f.duration) : ''}</div>${caption}${tail}`, 'media');
+      }
       const peaks = f.peaks || Array.from({ length: 40 }, () => 0.35);
       const bars = peaks.map(p => `<i style="height:${Math.round(p * 100)}%"></i>`).join('');
-      return wrap(`<div class="audio"><div class="icon${f.voice ? '' : ' file'}">${f.voice ? ICON.mic : ICON.headphones}</div><div class="wave">${bars}</div><div class="dur">${fmtDuration(f.duration)}</div></div><div class="fname">${esc(f.name)}</div>${caption}${tail}`, 'media');
+      return wrap(`<div class="audio">${icon}<div class="wave">${bars}</div><div class="dur">${fmtDuration(f.duration)}</div></div><div class="fname">${esc(f.name)}</div>${caption}${tail}`, 'media');
     }
     case 'contact': {
       const cards = (f.contacts || []).map(c => `<div class="contact"><div class="avatar">${ICON.person}</div><div><div class="cname">${esc(c.name)}</div>${c.phones.map(p => `<div class="cphone">${esc(p)}</div>`).join('')}${c.emails.map(e => `<div class="cphone">${esc(e)}</div>`).join('')}</div></div>`).join('');
-      return wrap(`${cards}${caption}${tail}`, 'media');
+      return wrap(`${linked(m.file, cards)}${caption}${tail}`, 'media');
     }
     default: {
       const isPdf = f.type === 'pdf';
       const subParts = [isPdf && f.pages ? `${f.pages} page${f.pages === 1 ? '' : 's'}` : '', (f.ext || 'file').toUpperCase(), fmtSize(f.size)].filter(Boolean);
       const preview = f.src ? `<img class="preview" src="${f.src}" alt="">` : '';
-      return wrap(`<div class="doc">${preview}<div class="bar"><div class="ficon${isPdf ? ' pdf' : ''}">${esc((f.ext || 'file').slice(0, 4))}</div><div class="info"><div class="dname">${esc(f.name)}</div><div class="dsub">${esc(subParts.join(' · '))}</div></div></div></div>${caption}${tail}`, 'media');
+      return wrap(`${linked(m.file, `<div class="doc">${preview}<div class="bar"><div class="ficon${isPdf ? ' pdf' : ''}">${esc((f.ext || 'file').slice(0, 4))}</div><div class="info"><div class="dname">${esc(f.name)}</div><div class="dsub">${esc(subParts.join(' · '))}</div></div></div></div>`)}${caption}${tail}`, 'media');
     }
   }
 }

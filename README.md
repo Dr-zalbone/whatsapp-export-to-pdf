@@ -1,6 +1,22 @@
 # WhatsApp Chat to PDF
 
-Upload a WhatsApp chat export (the ZIP from **Export chat › Include media**) and download a PDF that looks like the chat.
+Upload a WhatsApp chat export (the ZIP from **Export chat › Include media**) and download a PDF that looks like the chat, or a full evidence package for court.
+
+## Evidence package
+
+**Download evidence package** produces a ZIP:
+
+| Path | What it is |
+|---|---|
+| `chat.pdf` | Printable exhibit in WhatsApp layout. Every message is numbered (#1, #2, …) so it can be cited. |
+| `viewer.html` | The same chat for any browser, offline, with audio and video playing in place, and "go to message #". Fonts are embedded. Extract the ZIP before opening it. |
+| `original/` | Every file of the export, byte-identical. |
+| `playable/` | MP3 copies of audio whose format is not on the Israeli courts' list of accepted formats (WhatsApp voice notes are `.opus`). |
+| `manifest.txt` | How and when the package was made, the exporting party, missing/omitted media, conversions, and SHA-256 of every file and of the uploaded export (`sha256sum -c` format). |
+
+PDF viewers other than Adobe Acrobat do not play embedded audio/video, which is why media play in `viewer.html` instead of inside the PDF.
+
+The package is built in the browser (hashing with WebCrypto, MP3 encoding with lamejs); only the PDF is printed on the server. The whole export is held in browser memory while the ZIP is written, so very large exports (several GB) may not fit.
 
 ## Run
 
